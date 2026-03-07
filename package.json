@@ -1,6 +1,6 @@
 {
   "name": "agentfolio-mcp-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "MCP server for AgentFolio — agent identity, trust scores, and marketplace access for Claude, Cursor, and any MCP client",
   "main": "src/index.js",
   "bin": {

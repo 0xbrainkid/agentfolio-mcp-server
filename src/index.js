@@ -22,7 +22,24 @@ async function api(path, opts = {}) {
     const body = await res.text().catch(() => "");
     throw new Error(`AgentFolio API ${res.status}: ${body}`);
   }
+  // Guard against HTML error pages returned with 200
+  const ct = res.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) {
+    const body = await res.text().catch(() => "");
+    if (body.includes("<!DOCTYPE") || body.includes("<html")) {
+      throw new Error(`AgentFolio API returned HTML instead of JSON for ${path}`);
+    }
+  }
   return res.json();
+}
+
+// Soft API call — returns fallback on error instead of throwing
+async function apiSoft(path, fallback = null) {
+  try {
+    return await api(path);
+  } catch {
+    return fallback;
+  }
 }
 
 // ── Tool definitions ─────────────────────────────────────────────────────────
@@ -166,32 +183,76 @@ async function handleTool(name, args) {
     }
 
     case "agentfolio_search": {
-      const params = new URLSearchParams();
-      if (args.query) params.set("q", args.query);
-      if (args.skill) params.set("skill", args.skill);
-      if (args.category) params.set("category", args.category);
-      if (args.min_trust) params.set("minScore", String(args.min_trust));
-      if (args.limit) params.set("limit", String(args.limit));
-      const results = await api(`/search?${params}`);
-      return JSON.stringify(results, null, 2);
+      // /api/search is currently unavailable — fall back to client-side filtering of /api/profiles
+      const profilesData = await api("/profiles");
+      const allProfiles = profilesData.profiles || [];
+      const query = (args.query || "").toLowerCase();
+      const minTrust = args.min_trust || 0;
+      const limit = args.limit || 10;
+
+      let filtered = allProfiles;
+      if (query) {
+        filtered = filtered.filter((p) => {
+          const name = (p.name || "").toLowerCase();
+          const bio = (p.bio || p.description || "").toLowerCase();
+          const skills = (p.skills || [])
+            .map((s) => (typeof s === "string" ? s : s.name || "").toLowerCase())
+            .join(" ");
+          return name.includes(query) || bio.includes(query) || skills.includes(query);
+        });
+      }
+      if (minTrust > 0) {
+        filtered = filtered.filter((p) => (p.trustScore || 0) >= minTrust);
+      }
+      if (args.skill) {
+        const sk = args.skill.toLowerCase();
+        filtered = filtered.filter((p) =>
+          (p.skills || []).some((s) =>
+            (typeof s === "string" ? s : s.name || "").toLowerCase().includes(sk)
+          )
+        );
+      }
+      if (args.category) {
+        const cat = args.category.toLowerCase();
+        filtered = filtered.filter((p) =>
+          (p.skills || []).some(
+            (s) => typeof s === "object" && (s.category || "").toLowerCase().includes(cat)
+          )
+        );
+      }
+
+      return JSON.stringify(
+        {
+          query: args.query || "",
+          count: filtered.length,
+          results: filtered.slice(0, limit),
+          note: "Search performed client-side against agent directory. Some profile fields may be limited.",
+          totalRegistered: profilesData.total || 0,
+        },
+        null,
+        2
+      );
     }
 
     case "agentfolio_verify": {
       const profile = await api(`/profile/${args.agent_id}`);
-      const endorsements = await api(`/endorsements/${args.agent_id}`).catch(
-        () => ({ endorsements: [] })
+      // Endorsement endpoints are currently unavailable
+      const endorsements = await apiSoft(
+        `/profile/${args.agent_id}/endorsements`,
+        await apiSoft(`/endorsements/${args.agent_id}`, { received: [], given: [] })
       );
       return JSON.stringify(
         {
           agent_id: profile.id,
           name: profile.name,
-          trust_score: profile.trustScore,
+          trust_score: profile.trustScore ?? null,
           verifications: profile.verifications || [],
           wallets: profile.wallets || {},
-          endorsements: endorsements.endorsements || [],
+          endorsements_received: endorsements?.received || endorsements?.endorsements || [],
+          endorsements_given: endorsements?.given || [],
           skills: (profile.skills || []).map((s) => ({
-            name: s.name,
-            verified: s.verified,
+            name: typeof s === "string" ? s : s.name,
+            verified: typeof s === "object" ? s.verified : undefined,
           })),
           on_chain: (profile.verifications || []).includes("solana"),
         },
@@ -225,8 +286,21 @@ async function handleTool(name, args) {
     }
 
     case "agentfolio_marketplace_stats": {
-      const stats = await api(`/marketplace/stats`);
-      return JSON.stringify(stats, null, 2);
+      // /marketplace/stats endpoint is currently unavailable — compute from available data
+      const [profilesData, jobsData] = await Promise.all([
+        apiSoft("/profiles", { profiles: [], total: 0 }),
+        apiSoft("/marketplace/jobs", { jobs: [], total: 0 }),
+      ]);
+      return JSON.stringify(
+        {
+          totalAgents: profilesData.total || (profilesData.profiles || []).length,
+          totalJobs: jobsData.total || (jobsData.jobs || []).length,
+          openJobs: (jobsData.jobs || []).filter((j) => j.status === "open").length,
+          note: "Stats computed from available API endpoints. Some metrics may be approximate.",
+        },
+        null,
+        2
+      );
     }
 
     case "agentfolio_list_agents": {
@@ -235,7 +309,18 @@ async function handleTool(name, args) {
     }
 
     case "agentfolio_endorsements": {
-      const endorsements = await api(`/endorsements/${args.agent_id}`);
+      // Try both possible endorsement endpoints
+      const endorsements = await apiSoft(
+        `/profile/${args.agent_id}/endorsements`,
+        await apiSoft(`/endorsements/${args.agent_id}`, null)
+      );
+      if (!endorsements) {
+        return JSON.stringify({
+          agent_id: args.agent_id,
+          error: "Endorsements endpoint is currently unavailable",
+          note: "The AgentFolio endorsements API may be undergoing maintenance.",
+        }, null, 2);
+      }
       return JSON.stringify(endorsements, null, 2);
     }
 
@@ -314,7 +399,15 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     };
   }
   if (uri === "agentfolio://stats") {
-    const stats = await api("/marketplace/stats");
+    const [profilesData, jobsData] = await Promise.all([
+      apiSoft("/profiles", { profiles: [], total: 0 }),
+      apiSoft("/marketplace/jobs", { jobs: [], total: 0 }),
+    ]);
+    const stats = {
+      totalAgents: profilesData.total || (profilesData.profiles || []).length,
+      totalJobs: jobsData.total || (jobsData.jobs || []).length,
+      openJobs: (jobsData.jobs || []).filter((j) => j.status === "open").length,
+    };
     return {
       contents: [
         {
