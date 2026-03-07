@@ -1,0 +1,38 @@
+{
+  "name": "agentfolio-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for AgentFolio — agent identity, trust scores, and marketplace access for Claude, Cursor, and any MCP client",
+  "main": "src/index.js",
+  "bin": {
+    "agentfolio-mcp": "src/index.js"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/test.js"
+  },
+  "keywords": [
+    "mcp",
+    "agentfolio",
+    "ai-agents",
+    "trust",
+    "reputation",
+    "solana",
+    "satp",
+    "model-context-protocol",
+    "claude",
+    "cursor"
+  ],
+  "author": "brainAI <hello@brainai.dev>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/0xbrainkid/agentfolio-mcp-server"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
