@@ -1,0 +1,23 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      AGENTFOLIO_BASE_URL:
+        type: string
+        default: "https://agentfolio.bot/api"
+        description: "AgentFolio API base URL"
+      AGENTFOLIO_API_KEY:
+        type: string
+        description: "Optional API key for authenticated endpoints"
+    required: []
+  commandFunction:
+    |-
+    (config) => ({
+      command: "node",
+      args: ["src/index.js"],
+      env: {
+        AGENTFOLIO_BASE_URL: config.AGENTFOLIO_BASE_URL || "https://agentfolio.bot/api",
+        AGENTFOLIO_API_KEY: config.AGENTFOLIO_API_KEY || ""
+      }
+    })
