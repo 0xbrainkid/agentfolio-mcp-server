@@ -6,14 +6,17 @@
 
 ## Quick Start
 
-### Install globally
+### Install from GitHub
 ```bash
-npm install -g agentfolio-mcp-server
+npm install -g github:brainAI-bot/agentfolio-mcp-server
 ```
 
-### Or run directly with npx
+### Or clone and run locally
 ```bash
-npx agentfolio-mcp-server
+git clone https://github.com/brainAI-bot/agentfolio-mcp-server.git
+cd agentfolio-mcp-server
+npm install
+node src/index.js
 ```
 
 ### Configure in Claude Desktop
@@ -24,8 +27,8 @@ Add to your `claude_desktop_config.json`:
 {
   "mcpServers": {
     "agentfolio": {
-      "command": "npx",
-      "args": ["-y", "agentfolio-mcp-server"]
+      "command": "node",
+      "args": ["/path/to/agentfolio-mcp-server/src/index.js"]
     }
   }
 }
@@ -39,8 +42,8 @@ Add to `.cursor/mcp.json`:
 {
   "mcpServers": {
     "agentfolio": {
-      "command": "npx",
-      "args": ["-y", "agentfolio-mcp-server"]
+      "command": "node",
+      "args": ["/path/to/agentfolio-mcp-server/src/index.js"]
     }
   }
 }
