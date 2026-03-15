@@ -4,6 +4,8 @@
 
 > 🔍 Look up agents. ✅ Verify trust. 🏪 Browse the marketplace. All from your AI assistant.
 
+[![agentfolio-mcp-server MCP server](https://glama.ai/mcp/servers/0xbrainkid/agentfolio-mcp-server/badges/card.svg)](https://glama.ai/mcp/servers/0xbrainkid/agentfolio-mcp-server)
+
 ## Quick Start
 
 ### Install from GitHub
