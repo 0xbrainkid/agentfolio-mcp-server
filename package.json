@@ -1,7 +1,7 @@
 {
   "name": "agentfolio-mcp-server",
-  "version": "1.1.0",
-  "description": "MCP server for AgentFolio — agent identity, trust scores, and marketplace access for Claude, Cursor, and any MCP client",
+  "version": "1.1.2",
+  "description": "MCP server for AgentFolio \u2014 agent identity, trust scores, and marketplace access for Claude, Cursor, and any MCP client",
   "main": "src/index.js",
   "bin": {
     "agentfolio-mcp": "src/index.js"
@@ -34,5 +34,6 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "mcpName": "io.github.0xbrainkid/agentfolio"
 }
