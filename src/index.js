@@ -11,6 +11,22 @@ import {
 
 const API_BASE = "https://agentfolio.bot/api";
 
+// ── OATR Integration (Open Agent Trust Registry) ─────────────────────────────
+// Two-layer identity: OATR (off-chain operator) + SATP (on-chain reputation)
+let oatrAvailable = false;
+let verifyAttestation, OpenAgentTrustRegistry;
+try {
+  const oatr = await import("@open-agent-trust/registry");
+  verifyAttestation = oatr.verifyAttestation;
+  OpenAgentTrustRegistry = oatr.OpenAgentTrustRegistry || oatr.default;
+  if (verifyAttestation || OpenAgentTrustRegistry) {
+    oatrAvailable = true;
+    console.error("[agentfolio-mcp] OATR integration enabled");
+  }
+} catch {
+  console.error("[agentfolio-mcp] OATR not available (optional dependency)");
+}
+
 // ── HTTP helper ──────────────────────────────────────────────────────────────
 async function api(path, opts = {}) {
   const url = `${API_BASE}${path}`;
@@ -155,6 +171,25 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {},
+    },
+  },
+  {
+    name: "agentfolio_verify_operator",
+    description:
+      "Verify an agent's operator identity via OATR (Open Agent Trust Registry). Returns off-chain operator verification status alongside on-chain SATP reputation. Two-layer identity: who RUNS the agent (OATR) + how TRUSTED the agent is (SATP).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent_id: {
+          type: "string",
+          description: "Agent ID to check operator identity for",
+        },
+        token: {
+          type: "string",
+          description: "OATR attestation token to verify (optional — if not provided, checks AgentFolio profile for linked OATR identity)",
+        },
+      },
+      required: ["agent_id"],
     },
   },
   {
@@ -306,6 +341,62 @@ async function handleTool(name, args) {
     case "agentfolio_list_agents": {
       const profiles = await api(`/profiles`);
       return JSON.stringify(profiles, null, 2);
+    }
+
+    case "agentfolio_verify_operator": {
+      const profile = await api(`/profile/${args.agent_id}`);
+      const satpTrust = profile.trustScore ?? 0;
+      const verifs = profile.verifications || {};
+      const verifsArr = Array.isArray(verifs) ? verifs : Object.keys(verifs).filter(k => verifs[k]);
+      const satpOnChain = verifsArr.includes("solana") || !!verifs.solana;
+      
+      let oatrResult = null;
+      if (oatrAvailable) {
+        try {
+          if (args.token && verifyAttestation) {
+            // Verify a specific OATR attestation token
+            oatrResult = await verifyAttestation(args.token);
+          } else {
+            // Check if agent has OATR-linked identity via wallet key
+            const wallets = profile.wallets || {};
+            const solanaAddr = wallets.solana || wallets.sol;
+            oatrResult = {
+              checked: true,
+              linked: false,
+              note: solanaAddr 
+                ? `Agent has Solana wallet ${solanaAddr}. OATR operator lookup requires attestation token or DID.`
+                : "No Solana wallet linked. Cannot cross-reference with OATR operator registry.",
+            };
+          }
+        } catch (err) {
+          oatrResult = { checked: true, error: err.message };
+        }
+      } else {
+        oatrResult = {
+          checked: false,
+          note: "OATR integration not available. Install @open-agent-trust/registry for two-layer identity verification.",
+        };
+      }
+      
+      return JSON.stringify({
+        agent_id: args.agent_id,
+        name: profile.name,
+        two_layer_identity: {
+          layer1_oatr: {
+            description: "Off-chain operator identity (who runs this agent)",
+            ...oatrResult,
+          },
+          layer2_satp: {
+            description: "On-chain agent reputation (how trusted is this agent)",
+            trust_score: satpTrust,
+            on_chain: satpOnChain,
+            verifications: verifsArr,
+          },
+        },
+        combined_assessment: satpOnChain 
+          ? `Agent has on-chain SATP identity (trust: ${satpTrust}). ${oatrResult?.linked ? "OATR operator verified." : "OATR operator not yet linked."}`
+          : `Agent registered but no on-chain identity yet. Trust score: ${satpTrust}.`,
+      }, null, 2);
     }
 
     case "agentfolio_endorsements": {
