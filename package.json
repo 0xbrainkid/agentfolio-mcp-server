@@ -1,6 +1,6 @@
 {
   "name": "agentfolio-mcp-server",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "MCP server for AgentFolio \u2014 agent identity, trust scores, and marketplace access for Claude, Cursor, and any MCP client",
   "main": "src/index.js",
   "bin": {
@@ -38,5 +38,6 @@
   },
   "optionalDependencies": {
     "@open-agent-trust/registry": "^1.0.0"
-  }
+  },
+  "mcpName": "io.github.0xbrainkid/agentfolio-mcp-server"
 }
