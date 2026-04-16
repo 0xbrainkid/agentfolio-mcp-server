@@ -11,6 +11,47 @@ import {
 
 const API_BASE = "https://agentfolio.bot/api";
 
+// ── Beacon Integration ─────────────────────────────────────────────────────────
+const BEACON_API = "https://bottube.ai/api/beacon";
+
+async function beaconLookup(beaconId) {
+  // Query the Beacon directory for provenance info
+  const dirRes = await fetch(`${BEACON_API}/directory`);
+  if (!dirRes.ok) throw new Error(`Beacon directory unavailable: ${dirRes.status}`);
+  const dir = await dirRes.json();
+  
+  // Handle both array and object response formats
+  const beacons = Array.isArray(dir) ? dir : (dir.beacons || dir.entries || []);
+  
+  // Find beacon by ID or public key
+  const entry = beacons.find(e => 
+    e.beacon_id === beaconId || 
+    e.id === beaconId || 
+    e.public_key === beaconId ||
+    (e.beacon_id && e.beacon_id.toLowerCase().includes(beaconId.toLowerCase()))
+  );
+  return entry || null;
+}
+
+async function beaconAgentLookup(agentName) {
+  // Query agent profile from BoTTube
+  const agentRes = await fetch(`https://bottube.ai/api/agents?limit=50`);
+  if (!agentRes.ok) return null;
+  const agentData = await agentRes.json();
+  const agents = Array.isArray(agentData) ? agentData : (agentData.agents || agentData.data || []);
+  return agents.find(a => 
+    (a.name || '').toLowerCase().includes(agentName.toLowerCase()) ||
+    (a.agent_name || '').toLowerCase().includes(agentName.toLowerCase())
+  ) || null;
+}
+
+async function getBeaconDirectory() {
+  const dirRes = await fetch(`${BEACON_API}/directory`);
+  if (!dirRes.ok) throw new Error(`Beacon directory unavailable: ${dirRes.status}`);
+  const dir = await dirRes.json();
+  return Array.isArray(dir) ? dir : (dir.beacons || dir.entries || []);
+}
+
 // ── OATR Integration (Open Agent Trust Registry) ─────────────────────────────
 // Two-layer identity: OATR (off-chain operator) + SATP (on-chain reputation)
 let oatrAvailable = false;
@@ -205,6 +246,24 @@ const TOOLS = [
         },
       },
       required: ["agent_id"],
+    },
+  },
+  {
+    name: "agentfolio_beacon_lookup",
+    description:
+      "Dual-layer identity lookup: queries Beacon Protocol (bottube.ai) for cryptographic provenance + hardware fingerprint, AND AgentFolio for SATP behavioral trust score. Returns unified identity response combining both layers. Use for Moltbook migration verification or any agent identity check.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: {
+          type: "string",
+          description: "Beacon ID or public key to look up (e.g. a hex public key or beacon identifier)",
+        },
+        agent_name: {
+          type: "string",
+          description: "Agent name to look up on BoTTube (alternative to beacon_id)",
+        },
+      },
     },
   },
 ];
@@ -413,6 +472,91 @@ async function handleTool(name, args) {
         }, null, 2);
       }
       return JSON.stringify(endorsements, null, 2);
+    }
+
+    case "agentfolio_beacon_lookup": {
+      const { beacon_id, agent_name } = args;
+      
+      // Layer 1: Beacon provenance (hardware fingerprint + cryptographic identity)
+      let beaconData = null;
+      try {
+        const beacons = await getBeaconDirectory();
+        if (beacon_id) {
+          beaconData = beacons.find(e => 
+            e.beacon_id === beacon_id || e.id === beacon_id || e.public_key === beacon_id ||
+            (e.beacon_id && e.beacon_id.toLowerCase().includes(beacon_id.toLowerCase()))
+          ) || null;
+        } else if (agent_name) {
+          // First try direct agent lookup
+          const botAgent = await beaconAgentLookup(agent_name).catch(() => null);
+          if (botAgent && (botAgent.beacon_id || botAgent.id)) {
+            const searchId = botAgent.beacon_id || botAgent.id;
+            beaconData = beacons.find(e => 
+              e.beacon_id === searchId || e.id === searchId
+            ) || null;
+          }
+          // Fall back to name-based search in beacon directory
+          if (!beaconData) {
+            beaconData = beacons.find(e => 
+              (e.name || '').toLowerCase().includes(agent_name.toLowerCase()) ||
+              (e.agent_name || '').toLowerCase().includes(agent_name.toLowerCase())
+            ) || null;
+          }
+        }
+      } catch(e) {
+        beaconData = null;
+      }
+
+      // Layer 2: SATP trust score from AgentFolio
+      let satpData = null;
+      const searchName = (beaconData?.name || beaconData?.agent_name || agent_name || '').toLowerCase();
+      if (searchName) {
+        try {
+          const profilesData = await apiSoft("/profiles", { profiles: [] });
+          const allProfiles = profilesData.profiles || [];
+          const match = allProfiles.find(p => 
+            (p.name || '').toLowerCase() === searchName
+          );
+          if (match) {
+            satpData = {
+              trust_score: match.trustScore ?? null,
+              verifications: match.verifications || [],
+              skills: match.skills || [],
+              wallets: match.wallets || {},
+            };
+          }
+        } catch(e) { /* SATP lookup failed */ }
+      }
+
+      return JSON.stringify({
+        beacon_provenance: beaconData ? {
+          beacon_id: beaconData.beacon_id,
+          agent_name: beaconData.agent_name,
+          display_name: beaconData.display_name,
+          is_human: beaconData.is_human,
+          networks: beaconData.networks,
+          registered: beaconData.registered,
+        } : null,
+        satp_trust: satpData ? {
+          trust_score: satpData.trust_score,
+          verifications: satpData.verifications,
+          skills: satpData.skills,
+          wallets: satpData.wallets,
+        } : null,
+        dual_layer_assessment: !beaconData && !satpData
+          ? "Agent not found in Beacon or AgentFolio directories"
+          : beaconData && satpData
+          ? `VERIFIED: ${beaconData.display_name || beaconData.agent_name} has dual-layer identity (Beacon provenance + SATP trust: ${satpData.trust_score})`
+          : beaconData
+          ? `PARTIAL: ${beaconData.display_name || beaconData.agent_name} has Beacon provenance but no SATP trust profile yet`
+          : `PARTIAL: Agent found in AgentFolio but not in Beacon (no hardware fingerprint)`,
+        metadata: {
+          beacon_source: "https://bottube.ai/api/beacon/directory",
+          satp_source: "https://agentfolio.bot/api",
+          lookup_inputs: { beacon_id, agent_name },
+          note: "This tool combines Beacon Protocol (hardware-anchored provenance) with AgentFolio SATP (behavioral trust) for Moltbook migration verification.",
+        },
+      }, null, 2);
     }
 
     default:
