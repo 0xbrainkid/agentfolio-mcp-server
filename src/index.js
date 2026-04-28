@@ -207,6 +207,21 @@ const TOOLS = [
       required: ["agent_id"],
     },
   },
+  {
+    name: "agentfolio_beacon_lookup",
+    description:
+      "Look up an agent by its Bottube Beacon hardware identifier. Cross-references the beacon's registered agent name with AgentFolio to return provenance (beacon info), trust score (SATP), and a combined assessment.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: {
+          type: "string",
+          description: "Beacon ID to look up (hardware fingerprint identifier from Bottube Beacon directory)",
+        },
+      },
+      required: ["beacon_id"],
+    },
+  },
 ];
 
 // ── Tool handlers ────────────────────────────────────────────────────────────
@@ -413,6 +428,97 @@ async function handleTool(name, args) {
         }, null, 2);
       }
       return JSON.stringify(endorsements, null, 2);
+    }
+
+    case "agentfolio_beacon_lookup": {
+      // 1. Query Beacon directory
+      let directory;
+      try {
+        const res = await fetch("https://bottube.ai/api/beacon/directory");
+        if (!res.ok) {
+          throw new Error(`Beacon directory returned ${res.status}`);
+        }
+        directory = await res.json();
+      } catch (err) {
+        return JSON.stringify({
+          beacon_id: args.beacon_id,
+          error: `Failed to query Beacon directory: ${err.message}`,
+          provenance: null,
+          trust_score: null,
+          combined_assessment: "Beacon directory is currently unavailable. Cannot verify beacon provenance.",
+        }, null, 2);
+      }
+
+      // 2. Find the beacon
+      const beacons = directory.beacons || directory || [];
+      const beacon = Array.isArray(beacons)
+        ? beacons.find(b => b.beacon_id === args.beacon_id || b.id === args.beacon_id)
+        : null;
+
+      if (!beacon) {
+        return JSON.stringify({
+          beacon_id: args.beacon_id,
+          error: "Beacon not found in directory",
+          provenance: null,
+          trust_score: null,
+          combined_assessment: `No beacon found with id "${args.beacon_id}" in the Bottube Beacon directory.`,
+        }, null, 2);
+      }
+
+      // 3. Extract agent name
+      const agentName = beacon.agent_name || beacon.name || beacon.linked_identity || null;
+      if (!agentName) {
+        return JSON.stringify({
+          beacon_id: args.beacon_id,
+          error: "Beacon found but no agent name or linked identity",
+          provenance: {
+            beacon_id: beacon.beacon_id || beacon.id,
+            name: beacon.name || null,
+            fingerprint: beacon.fingerprint || beacon.hardware_info || null,
+            registered_at: beacon.registered_at || null,
+          },
+          trust_score: null,
+          combined_assessment: "This beacon is registered but does not have a linked agent identity. Cannot cross-reference with AgentFolio.",
+        }, null, 2);
+      }
+
+      // 4. Query AgentFolio by agent name
+      let profile;
+      try {
+        profile = await api(`/profile/${encodeURIComponent(agentName)}`);
+      } catch (err) {
+        return JSON.stringify({
+          beacon_id: args.beacon_id,
+          provenance: {
+            beacon_id: beacon.beacon_id || beacon.id,
+            name: agentName,
+            fingerprint: beacon.fingerprint || beacon.hardware_info || null,
+            registered_at: beacon.registered_at || null,
+          },
+          trust_score: null,
+          error: `Agent "${agentName}" not found on AgentFolio: ${err.message}`,
+          combined_assessment: `Beacon ${args.beacon_id} is linked to "${agentName}", but this agent is not registered on AgentFolio. Trust score unavailable.`,
+        }, null, 2);
+      }
+
+      // 5. Return unified response
+      return JSON.stringify({
+        beacon_id: args.beacon_id,
+        provenance: {
+          beacon_id: beacon.beacon_id || beacon.id,
+          name: agentName,
+          fingerprint: beacon.fingerprint || beacon.hardware_info || null,
+          registered_at: beacon.registered_at || null,
+        },
+        trust_score: {
+          overall_score: profile.trustScore ?? null,
+          level: profile.trustLevel ?? null,
+          verification_level: profile.verificationLevel ?? ((profile.verifications || []).length > 0 ? "verified" : "unverified"),
+        },
+        combined_assessment: profile.trustScore != null
+          ? `Beacon ${args.beacon_id} is linked to agent "${agentName}" (AgentFolio trust score: ${profile.trustScore}). ${(profile.verifications || []).length > 0 ? "Agent has verifications on file." : "No verifications on file."}`
+          : `Beacon ${args.beacon_id} is linked to agent "${agentName}". Agent is registered on AgentFolio but has no trust score yet.`,
+      }, null, 2);
     }
 
     default:
