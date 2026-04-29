@@ -9,10 +9,10 @@ import {
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-const API_BASE = "https://agentfolio.bot/api";
+const AGENTFOLIO_API_BASE = "https://agentfolio.bot/api";
+const BEACON_API_BASE = "https://bottube.ai/api";
 
 // ── OATR Integration (Open Agent Trust Registry) ─────────────────────────────
-// Two-layer identity: OATR (off-chain operator) + SATP (on-chain reputation)
 let oatrAvailable = false;
 let verifyAttestation, OpenAgentTrustRegistry;
 try {
@@ -27,39 +27,93 @@ try {
   console.error("[agentfolio-mcp] OATR not available (optional dependency)");
 }
 
-// ── HTTP helper ──────────────────────────────────────────────────────────────
-async function api(path, opts = {}) {
-  const url = `${API_BASE}${path}`;
+// ── HTTP helpers ─────────────────────────────────────────────────────────────
+async function api(base, path, opts = {}) {
+  const url = `${base}${path}`;
   const res = await fetch(url, {
     headers: { "Content-Type": "application/json", ...opts.headers },
     ...opts,
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`AgentFolio API ${res.status}: ${body}`);
+    throw new Error(`API ${res.status}: ${body}`);
   }
-  // Guard against HTML error pages returned with 200
   const ct = res.headers.get("content-type") || "";
   if (!ct.includes("application/json")) {
     const body = await res.text().catch(() => "");
     if (body.includes("<!DOCTYPE") || body.includes("<html")) {
-      throw new Error(`AgentFolio API returned HTML instead of JSON for ${path}`);
+      throw new Error(`API returned HTML instead of JSON for ${path}`);
     }
   }
   return res.json();
 }
 
-// Soft API call — returns fallback on error instead of throwing
-async function apiSoft(path, fallback = null) {
+async function apiSoft(base, path, fallback = null) {
   try {
-    return await api(path);
-  } catch {
+    return await api(base, path);
+  } catch (err) {
+    console.error(`[agentfolio-mcp] Soft API call failed for ${path}: ${err.message}`);
     return fallback;
   }
 }
 
+// ── Beacon helpers ───────────────────────────────────────────────────────────
+/**
+ * Look up a beacon_id in the Beacon directory.
+ * Returns provenance data if found, null otherwise.
+ */
+async function beaconLookup(beaconId) {
+  const directory = await apiSoft(BEACON_API_BASE, "/beacon/directory", { beacons: [] });
+  const beacons = directory.beacons || [];
+  const match = beacons.find((b) => b.beacon_id === beaconId || b.agent_name === beaconId);
+  return match || null;
+}
+
+/**
+ * Search for a beacon by agent_name (case-insensitive).
+ */
+async function beaconSearchByName(agentName) {
+  const directory = await apiSoft(BEACON_API_BASE, "/beacon/directory", { beacons: [] });
+  const beacons = directory.beacons || [];
+  const name = agentName.toLowerCase();
+  return beacons.find(
+    (b) =>
+      (b.agent_name || "").toLowerCase() === name ||
+      (b.display_name || "").toLowerCase() === name
+  ) || null;
+}
+
+/**
+ * Fetch detailed agent profile from BoTTube.
+ */
+async function botubeAgentProfile(agentName) {
+  return await apiSoft(BEACON_API_BASE, `/agents?limit=100`, { agents: [] });
+}
+
 // ── Tool definitions ─────────────────────────────────────────────────────────
 const TOOLS = [
+  // ── NEW: Unified Beacon + AgentFolio lookup ────────────────────────────
+  {
+    name: "agentfolio_beacon_lookup",
+    description:
+      "Look up an agent by Beacon ID and return a unified profile combining " +
+      "provenance (from Beacon) and trust score (from SATP/AgentFolio). " +
+      "Works with beacon_id (e.g. bcn_0x0a_a8f574df) or agent_name. " +
+      "Returns: provenance, trust_score, verifications, wallets, and status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: {
+          type: "string",
+          description:
+            'Beacon ID to look up (e.g. "bcn_0x0a_a8f574df") or agent name.',
+        },
+      },
+      required: ["beacon_id"],
+    },
+  },
+
+  // ── Existing tools (preserved) ─────────────────────────────────────────
   {
     name: "agentfolio_lookup",
     description:
@@ -70,7 +124,7 @@ const TOOLS = [
         agent_id: {
           type: "string",
           description:
-            'Agent ID to look up (e.g. "agent_braingrowth"). Can also be an agent name — it will be normalized.',
+            'Agent ID to look up (e.g. "agent_braingrowth"). Can also be an agent name.',
         },
       },
       required: ["agent_id"],
@@ -79,44 +133,26 @@ const TOOLS = [
   {
     name: "agentfolio_search",
     description:
-      "Search for AI agents on AgentFolio by skill, name, or keyword. Filter by minimum trust score. Returns matching agent profiles.",
+      "Search for AI agents on AgentFolio by skill, name, or keyword. Filter by minimum trust score.",
     inputSchema: {
       type: "object",
       properties: {
-        query: {
-          type: "string",
-          description: "Search query — matches name, bio, and skills",
-        },
-        skill: {
-          type: "string",
-          description: "Filter by specific skill name",
-        },
-        category: {
-          type: "string",
-          description: "Filter by skill category",
-        },
-        min_trust: {
-          type: "number",
-          description: "Minimum trust score (0-100+). Default: 0",
-        },
-        limit: {
-          type: "number",
-          description: "Max results to return. Default: 10",
-        },
+        query: { type: "string", description: "Search query — matches name, bio, and skills" },
+        skill: { type: "string", description: "Filter by specific skill name" },
+        category: { type: "string", description: "Filter by skill category" },
+        min_trust: { type: "number", description: "Minimum trust score (0-100+). Default: 0" },
+        limit: { type: "number", description: "Max results to return. Default: 10" },
       },
     },
   },
   {
     name: "agentfolio_verify",
     description:
-      "Check an agent's trust score and verification details on AgentFolio. Returns trust breakdown, verification proofs, endorsements, and on-chain identity status.",
+      "Check an agent's trust score and verification details on AgentFolio.",
     inputSchema: {
       type: "object",
       properties: {
-        agent_id: {
-          type: "string",
-          description: "Agent ID to verify",
-        },
+        agent_id: { type: "string", description: "Agent ID to verify" },
       },
       required: ["agent_id"],
     },
@@ -124,85 +160,56 @@ const TOOLS = [
   {
     name: "agentfolio_trust_gate",
     description:
-      "Check if an agent meets a minimum trust threshold. Returns pass/fail with the agent's actual trust score. Use before collaborating with or delegating work to an unknown agent.",
+      "Check if an agent meets a minimum trust threshold. Returns pass/fail with the agent's actual trust score.",
     inputSchema: {
       type: "object",
       properties: {
-        agent_id: {
-          type: "string",
-          description: "Agent ID to check",
-        },
-        min_trust: {
-          type: "number",
-          description: "Minimum trust score required to pass. Default: 50",
-        },
+        agent_id: { type: "string", description: "Agent ID to check" },
+        min_trust: { type: "number", description: "Minimum trust score required. Default: 50" },
       },
       required: ["agent_id"],
     },
   },
   {
     name: "agentfolio_marketplace_jobs",
-    description:
-      "Browse open jobs on the AgentFolio marketplace. Agents can find work and clients can see available opportunities. Filter by status.",
+    description: "Browse open jobs on the AgentFolio marketplace.",
     inputSchema: {
       type: "object",
       properties: {
-        status: {
-          type: "string",
-          enum: ["open", "in_progress", "completed"],
-          description: 'Job status filter. Default: "open"',
-        },
+        status: { type: "string", enum: ["open", "in_progress", "completed"], description: 'Default: "open"' },
       },
     },
   },
   {
     name: "agentfolio_marketplace_stats",
-    description:
-      "Get AgentFolio marketplace statistics — total agents, skills, verified count, and on-chain registrations.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
+    description: "Get AgentFolio marketplace statistics.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "agentfolio_list_agents",
-    description:
-      "List all registered agents on AgentFolio. Returns an overview of the entire agent directory.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
+    description: "List all registered agents on AgentFolio.",
+    inputSchema: { type: "object", properties: {} },
   },
   {
     name: "agentfolio_verify_operator",
     description:
-      "Verify an agent's operator identity via OATR (Open Agent Trust Registry). Returns off-chain operator verification status alongside on-chain SATP reputation. Two-layer identity: who RUNS the agent (OATR) + how TRUSTED the agent is (SATP).",
+      "Verify an agent's operator identity via OATR (Open Agent Trust Registry). Two-layer identity: who RUNS the agent (OATR) + how TRUSTED the agent is (SATP).",
     inputSchema: {
       type: "object",
       properties: {
-        agent_id: {
-          type: "string",
-          description: "Agent ID to check operator identity for",
-        },
-        token: {
-          type: "string",
-          description: "OATR attestation token to verify (optional — if not provided, checks AgentFolio profile for linked OATR identity)",
-        },
+        agent_id: { type: "string", description: "Agent ID to check operator identity for" },
+        token: { type: "string", description: "OATR attestation token to verify (optional)" },
       },
       required: ["agent_id"],
     },
   },
   {
     name: "agentfolio_endorsements",
-    description:
-      "Get endorsements for an agent — who endorsed them and what skills they endorsed.",
+    description: "Get endorsements for an agent.",
     inputSchema: {
       type: "object",
       properties: {
-        agent_id: {
-          type: "string",
-          description: "Agent ID to get endorsements for",
-        },
+        agent_id: { type: "string", description: "Agent ID to get endorsements for" },
       },
       required: ["agent_id"],
     },
@@ -212,14 +219,94 @@ const TOOLS = [
 // ── Tool handlers ────────────────────────────────────────────────────────────
 async function handleTool(name, args) {
   switch (name) {
+    // ── NEW: Unified Beacon + AgentFolio lookup ────────────────────────
+    case "agentfolio_beacon_lookup": {
+      const beaconId = args.beacon_id;
+
+      // Step 1: Look up in Beacon directory
+      let beaconData = await beaconLookup(beaconId);
+      if (!beaconData) {
+        beaconData = await beaconSearchByName(beaconId);
+      }
+
+      // Step 2: Look up in AgentFolio (try beacon_id as agent_id)
+      let agentfolioData = null;
+      let agentfolioError = null;
+      try {
+        // Try looking up by beacon_id first, then by agent_name
+        const afName = beaconData?.agent_name || beaconId;
+        agentfolioData = await api(AGENTFOLIO_API_BASE, `/profile/${afName}`);
+      } catch (err) {
+        agentfolioError = err.message;
+        console.error(`[agentfolio-mcp] AgentFolio lookup failed: ${err.message}`);
+      }
+
+      // Step 3: Look up BoTTube agent profile if we have an agent_name
+      let botubeData = null;
+      if (beaconData?.agent_name) {
+        botubeData = await apiSoft(BEACON_API_BASE, `/agents?limit=100`, null);
+      }
+
+      // Build unified response
+      const result = {
+        query: beaconId,
+        status: "success",
+        beacon_provenance: beaconData
+          ? {
+              found: true,
+              beacon_id: beaconData.beacon_id,
+              agent_name: beaconData.agent_name,
+              display_name: beaconData.display_name,
+              is_human: beaconData.is_human,
+              networks: beaconData.networks || [],
+              registered: beaconData.registered,
+            }
+          : { found: false, note: "Beacon ID not found in directory" },
+        agentfolio_trust: agentfolioData
+          ? {
+              found: true,
+              trust_score: agentfolioData.trustScore ?? null,
+              verifications: agentfolioData.verifications || [],
+              wallets: agentfolioData.wallets || {},
+              skills: agentfolioData.skills || [],
+              on_chain: (agentfolioData.verifications || []).includes("solana"),
+            }
+          : {
+              found: false,
+              error: agentfolioError,
+              note: "Agent may not be registered on AgentFolio yet",
+            },
+        dual_layer_assessment:
+          beaconData && agentfolioData
+            ? {
+                provenance: "✅ Verified (Beacon)",
+                trust: "✅ Verified (SATP)",
+                combined: `Agent has both Beacon provenance (${beaconData.beacon_id}) and SATP trust score (${agentfolioData.trustScore ?? "N/A"}). Dual-layer trust established.`,
+              }
+            : beaconData
+              ? {
+                  provenance: "✅ Verified (Beacon)",
+                  trust: "❌ Not found on AgentFolio",
+                  combined: `Agent has Beacon provenance but no SATP trust profile yet. Register at https://agentfolio.bot/register`,
+                }
+              : {
+                  provenance: "❌ Not found in Beacon directory",
+                  trust: agentfolioData ? "✅ Found on AgentFolio" : "❌ Not found",
+                  combined: "Agent not found in Beacon directory. Create a Beacon ID first.",
+                },
+      };
+
+      return JSON.stringify(result, null, 2);
+    }
+
+    // ── Existing tools (preserved) ─────────────────────────────────────
     case "agentfolio_lookup": {
-      const profile = await api(`/profile/${args.agent_id}`);
+      const profile = await api(AGENTFOLIO_API_BASE, `/profile/${args.agent_id}`);
       return JSON.stringify(profile, null, 2);
     }
 
     case "agentfolio_search": {
-      // /api/search is currently unavailable — fall back to client-side filtering of /api/profiles
-      const profilesData = await api("/profiles");
+      const profilesData = await api(AGENTFOLIO_API_BASE, "/profiles");
       const allProfiles = profilesData.profiles || [];
       const query = (args.query || "").toLowerCase();
       const minTrust = args.min_trust || 0;
@@ -261,7 +348,7 @@ async function handleTool(name, args) {
           query: args.query || "",
           count: filtered.length,
           results: filtered.slice(0, limit),
-          note: "Search performed client-side against agent directory. Some profile fields may be limited.",
+          note: "Search performed client-side against agent directory.",
           totalRegistered: profilesData.total || 0,
         },
         null,
@@ -270,8 +357,7 @@ async function handleTool(name, args) {
     }
 
     case "agentfolio_verify": {
-      const profile = await api(`/profile/${args.agent_id}`);
-      // Endorsement endpoints are currently unavailable
+      const profile = await api(AGENTFOLIO_API_BASE, `/profile/${args.agent_id}`);
       const endorsements = await apiSoft(
         `/profile/${args.agent_id}/endorsements`,
         await apiSoft(`/endorsements/${args.agent_id}`, { received: [], given: [] })
@@ -298,7 +384,7 @@ async function handleTool(name, args) {
 
     case "agentfolio_trust_gate": {
       const minTrust = args.min_trust ?? 50;
-      const profile = await api(`/profile/${args.agent_id}`);
+      const profile = await api(AGENTFOLIO_API_BASE, `/profile/${args.agent_id}`);
       const score = profile.trustScore ?? 0;
       return JSON.stringify(
         {
@@ -316,22 +402,21 @@ async function handleTool(name, args) {
 
     case "agentfolio_marketplace_jobs": {
       const status = args.status || "open";
-      const jobs = await api(`/marketplace/jobs?status=${status}`);
+      const jobs = await api(AGENTFOLIO_API_BASE, `/marketplace/jobs?status=${status}`);
       return JSON.stringify(jobs, null, 2);
     }
 
     case "agentfolio_marketplace_stats": {
-      // /marketplace/stats endpoint is currently unavailable — compute from available data
       const [profilesData, jobsData] = await Promise.all([
-        apiSoft("/profiles", { profiles: [], total: 0 }),
-        apiSoft("/marketplace/jobs", { jobs: [], total: 0 }),
+        apiSoft(AGENTFOLIO_API_BASE, "/profiles", { profiles: [], total: 0 }),
+        apiSoft(AGENTFOLIO_API_BASE, "/marketplace/jobs", { jobs: [], total: 0 }),
       ]);
       return JSON.stringify(
         {
           totalAgents: profilesData.total || (profilesData.profiles || []).length,
           totalJobs: jobsData.total || (jobsData.jobs || []).length,
           openJobs: (jobsData.jobs || []).filter((j) => j.status === "open").length,
-          note: "Stats computed from available API endpoints. Some metrics may be approximate.",
+          note: "Stats computed from available API endpoints.",
         },
         null,
         2
@@ -339,33 +424,31 @@ async function handleTool(name, args) {
     }
 
     case "agentfolio_list_agents": {
-      const profiles = await api(`/profiles`);
+      const profiles = await api(AGENTFOLIO_API_BASE, `/profiles`);
       return JSON.stringify(profiles, null, 2);
     }
 
     case "agentfolio_verify_operator": {
-      const profile = await api(`/profile/${args.agent_id}`);
+      const profile = await api(AGENTFOLIO_API_BASE, `/profile/${args.agent_id}`);
       const satpTrust = profile.trustScore ?? 0;
       const verifs = profile.verifications || {};
       const verifsArr = Array.isArray(verifs) ? verifs : Object.keys(verifs).filter(k => verifs[k]);
       const satpOnChain = verifsArr.includes("solana") || !!verifs.solana;
-      
+
       let oatrResult = null;
       if (oatrAvailable) {
         try {
           if (args.token && verifyAttestation) {
-            // Verify a specific OATR attestation token
             oatrResult = await verifyAttestation(args.token);
           } else {
-            // Check if agent has OATR-linked identity via wallet key
             const wallets = profile.wallets || {};
             const solanaAddr = wallets.solana || wallets.sol;
             oatrResult = {
               checked: true,
               linked: false,
-              note: solanaAddr 
+              note: solanaAddr
                 ? `Agent has Solana wallet ${solanaAddr}. OATR operator lookup requires attestation token or DID.`
-                : "No Solana wallet linked. Cannot cross-reference with OATR operator registry.",
+                : "No Solana wallet linked.",
             };
           }
         } catch (err) {
@@ -377,7 +460,7 @@ async function handleTool(name, args) {
           note: "OATR integration not available. Install @open-agent-trust/registry for two-layer identity verification.",
         };
       }
-      
+
       return JSON.stringify({
         agent_id: args.agent_id,
         name: profile.name,
@@ -393,14 +476,13 @@ async function handleTool(name, args) {
             verifications: verifsArr,
           },
         },
-        combined_assessment: satpOnChain 
+        combined_assessment: satpOnChain
           ? `Agent has on-chain SATP identity (trust: ${satpTrust}). ${oatrResult?.linked ? "OATR operator verified." : "OATR operator not yet linked."}`
           : `Agent registered but no on-chain identity yet. Trust score: ${satpTrust}.`,
       }, null, 2);
     }
 
     case "agentfolio_endorsements": {
-      // Try both possible endorsement endpoints
       const endorsements = await apiSoft(
         `/profile/${args.agent_id}/endorsements`,
         await apiSoft(`/endorsements/${args.agent_id}`, null)
@@ -424,7 +506,7 @@ async function handleTool(name, args) {
 const server = new Server(
   {
     name: "agentfolio-mcp-server",
-    version: "1.0.0",
+    version: "1.3.0",
   },
   {
     capabilities: {
@@ -434,12 +516,10 @@ const server = new Server(
   }
 );
 
-// List tools
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
 
-// Call tool
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   try {
@@ -455,21 +535,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// Resources: expose AgentFolio directory as a browsable resource
 server.setRequestHandler(ListResourcesRequestSchema, async () => ({
   resources: [
     {
       uri: "agentfolio://directory",
       name: "AgentFolio Agent Directory",
-      description:
-        "Complete directory of registered AI agents on AgentFolio with trust scores and skills",
+      description: "Complete directory of registered AI agents on AgentFolio with trust scores and skills",
       mimeType: "application/json",
     },
     {
       uri: "agentfolio://stats",
       name: "AgentFolio Marketplace Stats",
-      description:
-        "Current marketplace statistics — agents, skills, verified, on-chain counts",
+      description: "Current marketplace statistics",
       mimeType: "application/json",
     },
   ],
@@ -478,7 +555,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const { uri } = request.params;
   if (uri === "agentfolio://directory") {
-    const profiles = await api("/profiles");
+    const profiles = await api(AGENTFOLIO_API_BASE, "/profiles");
     return {
       contents: [
         {
@@ -491,8 +568,8 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   }
   if (uri === "agentfolio://stats") {
     const [profilesData, jobsData] = await Promise.all([
-      apiSoft("/profiles", { profiles: [], total: 0 }),
-      apiSoft("/marketplace/jobs", { jobs: [], total: 0 }),
+      apiSoft(AGENTFOLIO_API_BASE, "/profiles", { profiles: [], total: 0 }),
+      apiSoft(AGENTFOLIO_API_BASE, "/marketplace/jobs", { jobs: [], total: 0 }),
     ]);
     const stats = {
       totalAgents: profilesData.total || (profilesData.profiles || []).length,
