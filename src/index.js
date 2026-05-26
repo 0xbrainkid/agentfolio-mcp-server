@@ -10,6 +10,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 const API_BASE = "https://agentfolio.bot/api";
+const BEACON_DIR_URL = "https://bottube.ai/api/beacon/directory";
 
 // ── OATR Integration (Open Agent Trust Registry) ─────────────────────────────
 // Two-layer identity: OATR (off-chain operator) + SATP (on-chain reputation)
@@ -205,6 +206,21 @@ const TOOLS = [
         },
       },
       required: ["agent_id"],
+    },
+  },
+  {
+    name: "agentfolio_beacon_lookup",
+    description:
+      "Unified agent identity lookup: Beacon provenance (who created this?) + AgentFolio SATP trust score (should I trust this creator?). Queries bottube.ai Beacon directory and AgentFolio SATP registry. Returns cryptographic provenance and behavioral reputation in one call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: {
+          type: "string",
+          description: "Beacon ID to look up (e.g., 'bcn_xeophon_a1078c86')",
+        },
+      },
+      required: ["beacon_id"],
     },
   },
 ];
@@ -413,6 +429,88 @@ async function handleTool(name, args) {
         }, null, 2);
       }
       return JSON.stringify(endorsements, null, 2);
+    }
+
+    case "agentfolio_beacon_lookup": {
+      const beaconId = args.beacon_id;
+      if (!beaconId) {
+        return JSON.stringify({
+          error: "beacon_id is required",
+          status: "error",
+        }, null, 2);
+      }
+
+      const result = {
+        beacon_id: beaconId,
+        provenance: null,
+        trust: null,
+        status: "lookup_pending",
+        errors: [],
+      };
+
+      // 1. Query Beacon directory for provenance
+      try {
+        const beaconDir = await apiSoft(BEACON_DIR_URL, { beacons: [] });
+        const beacons = beaconDir.beacons || [];
+        const match = beacons.find((b) => b.beacon_id === beaconId);
+        if (match) {
+          result.provenance = {
+            beacon_id: match.beacon_id,
+            agent_name: match.agent_name,
+            display_name: match.display_name,
+            is_human: match.is_human || false,
+            networks: match.networks || [],
+            registered: match.registered || false,
+          };
+        } else {
+          result.errors.push(`Beacon ID '${beaconId}' not found in directory`);
+        }
+      } catch (e) {
+        result.errors.push(`Beacon directory error: ${e.message}`);
+      }
+
+      // 2. Query AgentFolio for trust score (match by agent name from beacon)
+      try {
+        const agentName = result.provenance?.agent_name || "";
+        if (agentName) {
+          const profilesData = await apiSoft("/profiles", { profiles: [] });
+          const profiles = profilesData.profiles || [];
+          const agentMatch = profiles.find(
+            (a) => a.name?.toLowerCase() === agentName.toLowerCase()
+          );
+          if (agentMatch) {
+            result.trust = {
+              agent_id: agentMatch.id,
+              name: agentMatch.name,
+              trust_score: agentMatch.trustScore ?? 0,
+              tier: agentMatch.tier ?? 0,
+              verification_level: agentMatch.verificationLevel ?? 0,
+              verification_badge: agentMatch.verificationBadge || "",
+            };
+          } else {
+            result.trust = {
+              status: "not_found",
+              message: `No AgentFolio profile matching '${agentName}' found.`,
+            };
+          }
+        } else {
+          result.trust = {
+            status: "unknown",
+            message: "Cannot match without beacon agent_name",
+          };
+        }
+      } catch (e) {
+        result.errors.push(`AgentFolio error: ${e.message}`);
+      }
+
+      // 3. Determine overall status
+      result.status = result.provenance
+        ? result.trust?.trust_score != null
+          ? "found"
+          : "partial"
+        : "not_found";
+
+      return JSON.stringify(result, null, 2);
     }
 
     default:
