@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { pathToFileURL } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -10,6 +11,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 const API_BASE = "https://agentfolio.bot/api";
+const BEACON_DIRECTORY_URL = "https://bottube.ai/api/beacon/directory";
 
 // ── OATR Integration (Open Agent Trust Registry) ─────────────────────────────
 // Two-layer identity: OATR (off-chain operator) + SATP (on-chain reputation)
@@ -59,6 +61,212 @@ async function apiSoft(path, fallback = null) {
 }
 
 // ── Tool definitions ─────────────────────────────────────────────────────────
+async function apiSoftResult(path, fallback = null) {
+  try {
+    return { data: await api(path), error: null };
+  } catch (err) {
+    return { data: fallback, error: err.message };
+  }
+}
+
+async function fetchJson(url, opts = {}) {
+  const res = await fetch(url, {
+    headers: { "Content-Type": "application/json", ...opts.headers },
+    ...opts,
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`${url} ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+async function fetchJsonSoft(url, fallback = null) {
+  try {
+    return { data: await fetchJson(url), error: null };
+  } catch (err) {
+    return { data: fallback, error: err.message };
+  }
+}
+
+function asArray(data, keys) {
+  if (Array.isArray(data)) {
+    return data;
+  }
+  for (const key of keys) {
+    if (Array.isArray(data?.[key])) {
+      return data[key];
+    }
+  }
+  return [];
+}
+
+function normalizeIdentity(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^@/, "")
+    .replace(/^agent_/, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function matchesIdentity(candidate, targets) {
+  const normalized = targets.map(normalizeIdentity).filter(Boolean);
+  if (normalized.length === 0) {
+    return false;
+  }
+  const fields = [
+    candidate.id,
+    candidate.name,
+    candidate.handle,
+    candidate.agent_id,
+    candidate.agentId,
+    candidate.display_name,
+  ];
+  return fields.some((field) => normalized.includes(normalizeIdentity(field)));
+}
+
+function satpVerified(profile) {
+  const verificationData = profile.verification_data || {};
+  const verifications = profile.verifications || profile.verification || {};
+  if (verificationData.satp?.verified || verificationData.satp_v3?.verified) {
+    return true;
+  }
+  if (Array.isArray(verifications)) {
+    return verifications.includes("satp") || verifications.includes("solana");
+  }
+  if (typeof verifications === "object" && verifications) {
+    return Boolean(verifications.satp?.verified || verifications.solana?.verified || verifications.satp);
+  }
+  return false;
+}
+
+function buildProvenance(beacon) {
+  if (!beacon) {
+    return null;
+  }
+  const registered = beacon.registered ?? beacon.atlas_registered ?? !beacon.expired;
+  return {
+    beacon_id: beacon.beacon_id || beacon.agent_id || beacon.id,
+    agent_name: beacon.agent_name || beacon.agent_id || null,
+    display_name: beacon.display_name || beacon.name || null,
+    is_human: Boolean(beacon.is_human),
+    networks: beacon.networks || [],
+    registered: Boolean(registered),
+    expired: Boolean(beacon.expired || registered === false),
+    source: BEACON_DIRECTORY_URL,
+  };
+}
+
+function buildTrust(profile) {
+  if (!profile) {
+    return {
+      status: "not_found",
+      message: "No matching AgentFolio SATP profile found for this Beacon identity.",
+    };
+  }
+  const score = profile.trustScore ?? profile.trust_score ?? null;
+  const verified = satpVerified(profile);
+  return {
+    status: verified || (score ?? 0) > 0 ? "found" : "untrusted",
+    agent_id: profile.id || profile.agent_id || null,
+    name: profile.name || null,
+    handle: profile.handle || null,
+    trust_score: score,
+    tier: profile.tier ?? null,
+    verification_level: profile.verificationLevel ?? profile.verification_level ?? null,
+    verification_badge: profile.verificationBadge ?? null,
+    verification_level_name: profile.verificationLevelName ?? null,
+    reputation_score: profile.reputationScore ?? profile.reputation_score ?? null,
+    reputation_rank: profile.reputationRank ?? null,
+    satp_verified: verified,
+    wallets: profile.wallets || (profile.wallet ? { primary: profile.wallet } : {}),
+    source: "https://agentfolio.bot/api/agents",
+  };
+}
+
+async function unifiedBeaconLookup(args) {
+  const beaconId = String(args.beacon_id || "").trim();
+  if (!beaconId) {
+    throw new Error("beacon_id is required");
+  }
+
+  const [beaconResult, agentsResult, profilesResult] = await Promise.all([
+    fetchJsonSoft(BEACON_DIRECTORY_URL, { beacons: [] }),
+    apiSoftResult("/agents?limit=200", { agents: [] }),
+    apiSoftResult("/profiles?limit=200", { profiles: [] }),
+  ]);
+
+  const beacons = asArray(beaconResult.data, ["beacons", "results", "directory"]);
+  const matchedBeacon = beacons.find((beacon) =>
+    [beacon.beacon_id, beacon.agent_id, beacon.id].some((value) => value === beaconId)
+  );
+  const provenance = buildProvenance(matchedBeacon);
+
+  const targets = [
+    args.agent_id,
+    args.agent_name,
+    matchedBeacon?.satp_profile_id,
+    matchedBeacon?.agent_name,
+    matchedBeacon?.display_name,
+  ];
+  const agentfolioProfiles = [
+    ...asArray(agentsResult.data, ["agents", "profiles", "results"]),
+    ...asArray(profilesResult.data, ["profiles", "agents", "results"]),
+  ];
+  const matchedProfile = agentfolioProfiles.find((profile) => matchesIdentity(profile, targets));
+  const trust = buildTrust(matchedProfile);
+
+  const warnings = [];
+  if (beaconResult.error) {
+    warnings.push(`Beacon directory unavailable: ${beaconResult.error}`);
+  }
+  if (agentsResult.error) {
+    warnings.push(`AgentFolio agents endpoint unavailable: ${agentsResult.error}`);
+  }
+  if (profilesResult.error) {
+    warnings.push(`AgentFolio profiles endpoint unavailable: ${profilesResult.error}`);
+  }
+  if (!matchedBeacon) {
+    warnings.push(`Beacon ID ${beaconId} was not found in the public Beacon directory.`);
+  } else if (provenance.expired || !provenance.registered) {
+    warnings.push("Beacon is present but not currently registered or verified.");
+  }
+  if (!matchedProfile) {
+    warnings.push("AgentFolio SATP profile could not be matched by agent ID, name, or handle.");
+  } else if (!trust.satp_verified) {
+    warnings.push("Matched AgentFolio profile does not expose a verified SATP attestation.");
+  }
+  if ((trust.trust_score ?? 0) <= 0) {
+    warnings.push("Trust score is missing or zero; treat this identity as untrusted until verified.");
+  }
+
+  const status = beaconResult.error
+    ? "offline"
+    : matchedBeacon && matchedProfile
+      ? "found"
+      : matchedBeacon || matchedProfile
+        ? "partial"
+        : "not_found";
+
+  return {
+    query: {
+      beacon_id: beaconId,
+      agent_id: args.agent_id || null,
+      agent_name: args.agent_name || null,
+    },
+    status,
+    provenance,
+    trust,
+    warnings,
+    sources: {
+      beacon_directory: BEACON_DIRECTORY_URL,
+      agentfolio_agents: "https://agentfolio.bot/api/agents",
+      agentfolio_profiles: "https://agentfolio.bot/api/profiles",
+    },
+  };
+}
+
 const TOOLS = [
   {
     name: "agentfolio_lookup",
@@ -205,6 +413,29 @@ const TOOLS = [
         },
       },
       required: ["agent_id"],
+    },
+  },
+  {
+    name: "agentfolio_beacon_lookup",
+    description:
+      "Look up a Beacon ID and return unified identity: Beacon provenance plus AgentFolio SATP trust score.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: {
+          type: "string",
+          description: 'Beacon ID to resolve (for example "bcn_xeophon_a1078c86").',
+        },
+        agent_id: {
+          type: "string",
+          description: "Optional AgentFolio agent ID hint if the Beacon display name differs.",
+        },
+        agent_name: {
+          type: "string",
+          description: "Optional AgentFolio agent name or handle hint for SATP matching.",
+        },
+      },
+      required: ["beacon_id"],
     },
   },
 ];
@@ -415,6 +646,11 @@ async function handleTool(name, args) {
       return JSON.stringify(endorsements, null, 2);
     }
 
+    case "agentfolio_beacon_lookup": {
+      const result = await unifiedBeaconLookup(args);
+      return JSON.stringify(result, null, 2);
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -513,5 +749,9 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 });
 
 // ── Start ────────────────────────────────────────────────────────────────────
-const transport = new StdioServerTransport();
-await server.connect(transport);
+export { TOOLS, handleTool, unifiedBeaconLookup };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}

@@ -61,6 +61,7 @@ Add to `.cursor/mcp.json`:
 | `agentfolio_marketplace_stats` | Get platform stats — total agents, skills, verified count |
 | `agentfolio_list_agents` | List all registered agents in the directory |
 | `agentfolio_endorsements` | Get endorsement history for an agent |
+| `agentfolio_beacon_lookup` | Resolve a Beacon ID into unified Beacon provenance plus AgentFolio SATP trust |
 
 ## Resources
 
@@ -78,6 +79,7 @@ Once configured, you can ask Claude or Cursor:
 - *"Is agent_braingrowth trustworthy enough to handle a coding task? Use a trust threshold of 60."*
 - *"Show me open jobs on the AgentFolio marketplace"*
 - *"How many agents are registered on AgentFolio?"*
+- *"Look up Beacon ID bcn_xeophon_a1078c86 and show the linked AgentFolio trust score."*
 
 ## How It Works
 
